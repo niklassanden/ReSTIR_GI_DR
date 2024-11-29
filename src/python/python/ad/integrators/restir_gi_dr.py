@@ -287,6 +287,8 @@ class ReStirGIDRIntegrator(RBIntegrator):
                                  si, None, None, reservoir.uvw, reservoir.valid)
 
         # Random replay shift - reusing random numbers
+        with dr.resume_grad():
+            dr.set_grad(param_tensor, 1)
         _, grad, _ = \
             self.eval_sample(dr.ADMode.Forward, scene,
                                  si, L, None,
@@ -326,17 +328,19 @@ class ReStirGIDRIntegrator(RBIntegrator):
                           sampler.next_1d(active_next),
                           0)
 
-        with dr.suspend_grad():
-            L = None
-            if not primal:
+        L = None
+        if not primal:
+            with dr.suspend_grad():
                 L, _, _ = \
                     self.eval_sample(dr.ADMode.Primal, scene,
                                      si, None, None,
                                      seed, active_next)
 
-        inner_mode = mode if primal else (dr.ADMode.Backward if self.use_ref else dr.ADMode.Forward)
+        if mode == dr.ADMode.Forward:
+            with dr.resume_grad():
+                dr.set_grad(params, 1)
         Ld, grad, texel_indices = \
-            self.eval_sample(inner_mode, scene, si, L, w, seed, active_next)
+            self.eval_sample(mode, scene, si, L, w if self.use_ref else None, seed, active_next)
 
         # ------------------ Differential phase only ------------------
         if not primal:
@@ -350,7 +354,7 @@ class ReStirGIDRIntegrator(RBIntegrator):
                         self.get_reservoir_length())
 
                     def update_grad_with_sample(tech, f, uvw, texel_index, active):
-                        grad_inner = f
+                        grad_inner = w * f
 
                         # The target value comes premultiplied by the inverse candidate pdf, q / p
                         # This allows implicit computation of the random replay Jacobian when
@@ -741,7 +745,7 @@ class ReStirGIDRIntegrator(RBIntegrator):
 
             # ------------------------ Candidate generation (Alg 2 in paper) ----------------------
             L, valid, state_out = self.sample(
-                mode=dr.ADMode.Backward,
+                mode=dr.ADMode.Backward if self.use_ref else dr.ADMode.Forward,
                 scene=scene,
                 params=params,
                 sampler=sampler,
