@@ -32,8 +32,3 @@ __pycache__
 
 /_skbuild
 /mitsuba.egg-info
-
-scenes/*
-!scenes/cornell-box
-!scenes/grape
-!scenes/teapot
