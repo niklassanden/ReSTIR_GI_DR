@@ -5,10 +5,13 @@
 	<default name="spp" value="512"/>
 	<default name="resx" value="1400"/>
 	<default name="resy" value="1400"/>
+	<default name="max_depth" value="65" />
+	<integrator type="$integrator">
+		<integer name="max_depth" value="$max_depth" />
+	</integrator>
 
 <!-- Camera and Rendering Parameters -->
 
-	<integrator type="$integrator" />
 	<sensor type="perspective">
 		<string name="fov_axis" value="x"/>
 		<float name="fov" value="39.597755"/>
