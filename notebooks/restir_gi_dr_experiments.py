@@ -57,8 +57,18 @@ scene_configs = {
         max_depth=3,
         include_restir_dr=True,
     ),
+    'living-room-2': Config('living-room-2', '../scenes/living-room-2/tire_living_room.xml', 'mat-tire.brdf_0.roughness.data',
+        render_spp=512,
+        spp_forward=32,
+        restir_spp=1,
+        time=15e3,
+        lr=0.01,
+        restir_mcap=16,
+        max_depth=3,
+        include_restir_dr=False,
+    ),
 }
-config = scene_configs['veach-ajar']
+config = scene_configs['living-room-2']
 
 output_dir = os.path.join(output_dir_base, config.scene_name)
 os.makedirs(output_dir, exist_ok=True)
@@ -169,12 +179,14 @@ def get_equal_time_optimization(use_ref, spp_grad):
     total_time = 0
     times = []
     losses = []
+    errors = []
 
     progress_bar = tqdm(total=round(config.time), desc="Progress", position=0)
     update_lr_freq = 100 // (config.lr_updates + 1)
     lr_last_updated = 0
     while True:
         grads = dr.grad(opt[config.key])
+        accumulated_loss = 0
         for _ in range(config.grad_passes):
             # Perform a (noisy) differentiable rendering of the scene
             image = mi.render(scene, params, spp=config.spp_forward,
@@ -186,8 +198,10 @@ def get_equal_time_optimization(use_ref, spp_grad):
 
             # Backpropagate through the rendering process
             dr.backward(loss)
+            accumulated_loss += loss
             grads += dr.grad(opt[config.key])
             dr.set_grad(opt[config.key], 0)
+        accumulated_loss /= config.grad_passes
         dr.set_grad(opt[config.key], grads / config.grad_passes)
 
         # Optimizer: take a gradient descent step
@@ -207,9 +221,10 @@ def get_equal_time_optimization(use_ref, spp_grad):
             opt.set_learning_rate({'data': new_lr, config.key: new_lr})
 
         with dr.suspend_grad():
-            losses.append(relmse(params[config.key], param_ref)[0])
+            losses.append(accumulated_loss[0])
+            errors.append(relmse(params[config.key], param_ref)[0])
         times.append(total_time / 1e3)
-        progress_bar.set_postfix({"Error": f"{losses[-1]:.4f}", "Iteration": it+1, "lr": opt.lr['data']}, refresh=True)
+        progress_bar.set_postfix({"Error": f"{errors[-1]:.4f}", "Loss": f"{losses[-1]:.4f}", "Iteration": it+1, "lr": opt.lr['data']}, refresh=True)
         progress_bar.n = round(min(config.time, total_time))
         progress_bar.last_print_n = progress_bar.n
         progress_bar.update(0)
@@ -221,32 +236,35 @@ def get_equal_time_optimization(use_ref, spp_grad):
 
     progress_bar.close()
 
-    return times, losses, mi.TensorXf(params[config.key])
+    return times, losses, errors, mi.TensorXf(params[config.key])
 
-restir_times, restir_losses, restir_param = \
-    get_equal_time_optimization(False, config.restir_spp)
-
-mitsuba_times, mitsuba_losses, mitsuba_param = \
+mitsuba_times, mitsuba_losses, mitsuba_errors, mitsuba_param = \
     get_equal_time_optimization(True, config.mitsuba_spp)
+
+restir_times, restir_losses, restir_errors, restir_param = \
+    get_equal_time_optimization(False, config.restir_spp)
 
 if config.include_restir_dr:
     set_max_depth(scene, 2)
-    restir_dr_times, restir_dr_losses, restir_dr_param = \
+    restir_dr_times, restir_dr_losses, restir_dr_errors, restir_dr_param = \
         get_equal_time_optimization(False, config.restir_spp)
     set_max_depth(scene)
 
 # %% Output equal time optimization
-plt.clf()
-plt.figure(figsize=(10, 4), dpi=100, constrained_layout=True);
-plt.plot(restir_times, restir_losses, 'c-o', label='Ours', linewidth=6.0, markersize=4.0, mfc='white')
-plt.plot(mitsuba_times, mitsuba_losses, 'm-o', label='Mitsuba 3', linewidth=6.0, markersize=4.0, mfc='white')
-if config.include_restir_dr:
-    plt.plot(restir_dr_times, restir_dr_losses, 'y-o', label='ReSTIR DR', linewidth=6.0, markersize=4.0, mfc='white')
-plt.xlabel('Time (s)');
-plt.ylabel('Error');
-plt.yscale('log')
-plt.legend();
-plt.savefig(os.path.join(output_dir, 'inv_convergence.pdf'), bbox_inches='tight', pad_inches=0.0)
+def plot_graph(ylabel, restir_values, mitsuba_values, restir_dr_values):
+    plt.clf()
+    plt.figure(figsize=(10, 4), dpi=100, constrained_layout=True);
+    plt.plot(restir_times, restir_values, 'c-o', label='Ours', linewidth=6.0, markersize=4.0, mfc='white')
+    plt.plot(mitsuba_times, mitsuba_values, 'm-o', label='Mitsuba 3', linewidth=6.0, markersize=4.0, mfc='white')
+    if config.include_restir_dr:
+        plt.plot(restir_dr_times, restir_dr_values, 'y-o', label='ReSTIR DR', linewidth=6.0, markersize=4.0, mfc='white')
+    plt.xlabel('Time (s)');
+    plt.ylabel(ylabel);
+    plt.yscale('log')
+    plt.legend();
+    plt.savefig(os.path.join(output_dir, f'{ylabel}.pdf'), bbox_inches='tight', pad_inches=0.0)
+plot_graph('Loss', restir_losses, mitsuba_losses, restir_dr_losses if config.include_restir_dr else None)
+plot_graph('Error', restir_errors, mitsuba_errors, restir_dr_errors if config.include_restir_dr else None)
 
 # %% Output equal time final image
 params[config.key] = restir_param
@@ -272,15 +290,3 @@ if config.include_restir_dr:
     restir_dr_image_direct = render_clean_image(scene);
     mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir_dr_direct.exr'), restir_dr_image_direct)
     set_max_depth(scene)
-
-restir_img_err = restir_losses[-1]
-mitsuba_img_err = mitsuba_losses[-1]
-if config.include_restir_dr:
-    restir_dr_img_err = restir_dr_losses[-1]
-
-print(
-    f'ReSTIR, error: {restir_img_err:.6e} ({restir_img_err/mitsuba_img_err:.5f}x)\n'
-    f'Mitsuba, error: {mitsuba_img_err:.6e} (1.00x)\n'
-)
-if config.include_restir_dr:
-    f'ReSTIR DR, error: {restir_dr_img_err:.6e} ({restir_dr_img_err/mitsuba_img_err:.5f}x)\n'
