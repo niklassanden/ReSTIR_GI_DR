@@ -1,10 +1,9 @@
-# %%
+# %% Setup
 import mitsuba as mi
 import drjit as dr
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import json
 from tqdm import tqdm
 
 mi.set_variant('cuda_ad_rgb')
@@ -12,9 +11,22 @@ mi.set_variant('cuda_ad_rgb')
 output_dir_base = 'inverse-rendering'
 os.makedirs(output_dir_base, exist_ok=True)
 
-# %% Load scene and parameters
+# %% Load config
 class Config():
-    def __init__(self, scene_name, path, key, render_spp=512, spp_forward=32, restir_spp=1, mitsuba_spp=None, grad_passes=1, time=3e4, lr=0.1, lr_factor=0.5, lr_updates=0, restir_mcap=16, integrator='restir_gi_dr', max_depth=2):
+    def __init__(self, scene_name, path, key,
+                 render_spp=512,
+                 spp_forward=32,
+                 restir_spp=1,
+                 mitsuba_spp=None,
+                 grad_passes=1,
+                 time=3e4,
+                 lr=0.1,
+                 lr_factor=0.5,
+                 lr_updates=0,
+                 restir_mcap=16,
+                 max_depth=2,
+                 include_restir_dr=False
+    ):
         self.scene_name = scene_name
         self.path = path
         self.key = key
@@ -28,8 +40,10 @@ class Config():
         self.lr_factor = lr_factor
         self.lr_updates = lr_updates
         self.restir_mcap = restir_mcap
-        self.integrator = integrator
         self.max_depth = max_depth
+        self.include_restir_dr = include_restir_dr
+        assert (not include_restir_dr) or max_depth >= 3
+
 scene_configs = {
     'veach-ajar': Config('veach-ajar', '../scenes/veach-ajar/scene.xml', 'LandscapeBSDF.brdf_0.reflectance.data',
         render_spp=512,
@@ -41,6 +55,7 @@ scene_configs = {
         lr_updates=3,
         restir_mcap=16,
         max_depth=3,
+        include_restir_dr=True,
     ),
 }
 config = scene_configs['veach-ajar']
@@ -48,7 +63,7 @@ config = scene_configs['veach-ajar']
 output_dir = os.path.join(output_dir_base, config.scene_name)
 os.makedirs(output_dir, exist_ok=True)
 
-# %%
+# %% Utility functions
 def convert_to_lum(grad_tensor, extend_dim=False):
     if len(grad_tensor.shape) != 3:
         return grad_tensor
@@ -74,6 +89,11 @@ def render_clean_image(scene, spp=config.render_spp):
         count += 1
     return image / count
 
+def set_max_depth(scene, max_depth=config.max_depth):
+    scene.integrator().max_depth = max_depth
+    # Disable russian roulette for now
+    scene.integrator().rr_depth = max_depth + 10
+
 def get_elapsed_execution_time():
     hist = dr.kernel_history()
     elapsed_time = 0
@@ -97,16 +117,14 @@ def loss_func(image, image_gt):
     return relmse(image, image_gt)
 
 
-# %%
+# %% Load scene and parameters
 print(f'-------------------- Running {config.scene_name} -------------------------')
 
-scene = mi.load_file(config.path, integrator=config.integrator)
-scene.integrator().max_depth = config.max_depth
-# Disable russian roulette for now
-scene.integrator().rr_depth = config.max_depth + 10
+scene = mi.load_file(config.path, integrator='restir_gi_dr')
+set_max_depth(scene)
 
 params = mi.traverse(scene)
-print(params)
+# print(params)
 param_ref = mi.TensorXf(params[config.key])
 param_shape = np.array(params[config.key].shape)
 param_initial = np.full(param_shape.tolist(), 0.5)
@@ -146,8 +164,7 @@ def get_equal_time_optimization(use_ref, spp_grad):
     scene.integrator().use_positivization = True
     scene.integrator().enable_temporal_reuse = True
     scene.integrator().M_cap = config.restir_mcap * spp_grad
-    if config.integrator in ['restir_dr', 'restir_gi_dr']:
-        scene.integrator().reset()
+    scene.integrator().reset()
     it = 0
     total_time = 0
     times = []
@@ -212,11 +229,19 @@ restir_times, restir_losses, restir_param = \
 mitsuba_times, mitsuba_losses, mitsuba_param = \
     get_equal_time_optimization(True, config.mitsuba_spp)
 
+if config.include_restir_dr:
+    set_max_depth(scene, 2)
+    restir_dr_times, restir_dr_losses, restir_dr_param = \
+        get_equal_time_optimization(False, config.restir_spp)
+    set_max_depth(scene)
+
 # %% Output equal time optimization
 plt.clf()
 plt.figure(figsize=(10, 4), dpi=100, constrained_layout=True);
 plt.plot(restir_times, restir_losses, 'c-o', label='Ours', linewidth=6.0, markersize=4.0, mfc='white')
 plt.plot(mitsuba_times, mitsuba_losses, 'm-o', label='Mitsuba 3', linewidth=6.0, markersize=4.0, mfc='white')
+if config.include_restir_dr:
+    plt.plot(restir_dr_times, restir_dr_losses, 'y-o', label='ReSTIR DR', linewidth=6.0, markersize=4.0, mfc='white')
 plt.xlabel('Time (s)');
 plt.ylabel('Error');
 plt.yscale('log')
@@ -236,22 +261,26 @@ mitsuba_image = render_clean_image(scene);
 mi.util.write_bitmap(os.path.join(output_dir, 'render_final_mitsuba.exr'), mitsuba_image)
 mi.util.write_bitmap(os.path.join(output_dir, 'texture_final_mitsuba.png'), mitsuba_param)
 
+if config.include_restir_dr:
+    params[config.key] = restir_dr_param
+    params.update();
+    restir_dr_image = render_clean_image(scene);
+    mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir_dr.exr'), restir_dr_image)
+    mi.util.write_bitmap(os.path.join(output_dir, 'texture_final_restir_dr.png'), restir_dr_param)
+
+    set_max_depth(scene, 2)
+    restir_dr_image_direct = render_clean_image(scene);
+    mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir_dr_direct.exr'), restir_dr_image_direct)
+    set_max_depth(scene)
+
 restir_img_err = restir_losses[-1]
 mitsuba_img_err = mitsuba_losses[-1]
+if config.include_restir_dr:
+    restir_dr_img_err = restir_dr_losses[-1]
 
 print(
     f'ReSTIR, error: {restir_img_err:.6e} ({restir_img_err/mitsuba_img_err:.5f}x)\n'
     f'Mitsuba, error: {mitsuba_img_err:.6e} (1.00x)\n'
 )
-
-with open(os.path.join(output_dir, 'inv_convergence.json'), 'w') as f:
-    json_str = json.dumps({
-        'restir_times': restir_times,
-        'restir_losses': restir_losses,
-        'mitsuba_times': mitsuba_times,
-        'mitsuba_losses': mitsuba_losses,
-        'restir_img_err': restir_img_err,
-        'mitsuba_img_err': mitsuba_img_err,
-        'img_err_reduction': restir_img_err/mitsuba_img_err,
-    }, indent=2)
-    f.write(json_str)
+if config.include_restir_dr:
+    f'ReSTIR DR, error: {restir_dr_img_err:.6e} ({restir_dr_img_err/mitsuba_img_err:.5f}x)\n'
