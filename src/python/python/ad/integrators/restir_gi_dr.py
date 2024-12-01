@@ -755,7 +755,11 @@ class ReStirGIDRIntegrator(RBIntegrator):
                 active=mi.Bool(True)
             )
 
-            if not self.use_ref:
+            if self.use_ref:
+                param_tensor: mi.TensorXf = params.get(self.param_name)
+                with dr.resume_grad():
+                    dr.set_grad(param_tensor, dr.grad(param_tensor) / spp)
+            else:
                 param_tensor: mi.TensorXf = params.get(self.param_name)
 
                 # --------------- Iteration reuse in parameter-space (Alg 3 in paper) ------------
