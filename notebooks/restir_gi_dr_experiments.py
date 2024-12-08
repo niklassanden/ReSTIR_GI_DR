@@ -8,6 +8,9 @@ from tqdm import tqdm
 
 mi.set_variant('cuda_ad_rgb')
 
+#hdr_format = 'exr'
+hdr_format = 'png'
+
 output_dir_base = 'inverse-rendering'
 os.makedirs(output_dir_base, exist_ok=True)
 
@@ -19,12 +22,12 @@ class Config():
                  restir_spp=1,
                  mitsuba_spp=None,
                  grad_passes=1,
-                 time=3e4,
+                 time=30e3,
                  lr=0.1,
                  lr_factor=0.5,
                  lr_updates=0,
                  restir_mcap=16,
-                 max_depth=2,
+                 max_depth=3,
                  include_restir_dr=False
     ):
         self.scene_name = scene_name
@@ -42,38 +45,52 @@ class Config():
         self.restir_mcap = restir_mcap
         self.max_depth = max_depth
         self.include_restir_dr = include_restir_dr
-        assert (not include_restir_dr) or max_depth >= 3
 
 scene_configs = {
     'veach-ajar': Config('veach-ajar', '../scenes/veach-ajar/scene.xml', 'LandscapeBSDF.brdf_0.reflectance.data',
-        render_spp=512,
+        render_spp=512*8,
         spp_forward=32,
         restir_spp=1,
-        time=3e4,
+        time=30e3,
         lr=0.1,
         lr_factor=0.5,
         lr_updates=3,
         restir_mcap=16,
-        max_depth=3,
-        include_restir_dr=True,
+        max_depth=9,
+        include_restir_dr=False,
     ),
     'living-room-2': Config('living-room-2', '../scenes/living-room-2/tire_living_room.xml', 'mat-tire.brdf_0.roughness.data',
-        render_spp=512,
-        spp_forward=32,
-        restir_spp=1,
         time=15e3,
         lr=0.01,
-        restir_mcap=16,
         max_depth=3,
         include_restir_dr=False,
     ),
+    'staircase2': Config('staircase2', '../scenes/staircase2/scene.xml', 'FloorTilesBSDF.brdf_0.base_color.data',
+        restir_spp=1,
+        time=10e3,
+        lr=0.05,
+        restir_mcap=16,
+        max_depth=2,
+        include_restir_dr=True,
+    ),
+    'cornell-box': Config('cornell-box', '../scenes/cornell_box_picture/scene_picture.xml', 'PaintingBSDF.brdf_0.reflectance.data',
+        restir_spp=1,
+        time=30e3,
+        lr=0.1,
+        restir_mcap=16,
+        max_depth=2,
+        include_restir_dr=True,
+    ),
 }
-config = scene_configs['living-room-2']
+config = scene_configs['cornell-box']
 
 output_dir = os.path.join(output_dir_base, config.scene_name)
 os.makedirs(output_dir, exist_ok=True)
 
 # %% Utility functions
+def write_image(name, data, hdr=True):
+    mi.util.write_bitmap(os.path.join(output_dir, f'{name}.{hdr_format if hdr else "png"}'), data)
+
 def convert_to_lum(grad_tensor, extend_dim=False):
     if len(grad_tensor.shape) != 3:
         return grad_tensor
@@ -134,7 +151,7 @@ scene = mi.load_file(config.path, integrator='restir_gi_dr')
 set_max_depth(scene)
 
 params = mi.traverse(scene)
-# print(params)
+print(params)
 param_ref = mi.TensorXf(params[config.key])
 param_shape = np.array(params[config.key].shape)
 param_initial = np.full(param_shape.tolist(), 0.5)
@@ -143,14 +160,14 @@ if param_shape[2] == 4:
     param_ref[:,:,3] = 1
 
 image_gt = render_clean_image(scene)
-mi.util.write_bitmap(os.path.join(output_dir, 'render_gt.exr'), image_gt)
-mi.util.write_bitmap(os.path.join(output_dir, 'texture_gt.png'), param_ref)
+write_image('render_gt', image_gt, hdr=True)
+write_image('texture_gt', param_ref, hdr=False)
 
 params[config.key] = mi.TensorXf(param_initial)
 params.update();
 image_initial = render_clean_image(scene)
-mi.util.write_bitmap(os.path.join(output_dir, 'render_initial.exr'), image_initial)
-mi.util.write_bitmap(os.path.join(output_dir, 'texture_initial.png'), param_initial)
+write_image('render_initial', image_initial, hdr=True)
+write_image('texture_initial', param_initial, hdr=False)
 
 opt = mi.ad.Adam(lr=config.lr)
 opt[config.key] = params[config.key]
@@ -270,23 +287,24 @@ plot_graph('Error', restir_errors, mitsuba_errors, restir_dr_errors if config.in
 params[config.key] = restir_param
 params.update();
 restir_image = render_clean_image(scene);
-mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir.exr'), restir_image)
-mi.util.write_bitmap(os.path.join(output_dir, 'texture_final_restir.png'), restir_param)
+write_image('render_final_restir', restir_image, hdr=True)
+write_image('texture_final_restir', restir_param, hdr=False)
 
 params[config.key] = mitsuba_param
 params.update();
 mitsuba_image = render_clean_image(scene);
-mi.util.write_bitmap(os.path.join(output_dir, 'render_final_mitsuba.exr'), mitsuba_image)
-mi.util.write_bitmap(os.path.join(output_dir, 'texture_final_mitsuba.png'), mitsuba_param)
+write_image('render_final_mitsuba', mitsuba_image, hdr=True)
+write_image('texture_final_mitsuba', mitsuba_param, hdr=False)
 
 if config.include_restir_dr:
     params[config.key] = restir_dr_param
     params.update();
     restir_dr_image = render_clean_image(scene);
-    mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir_dr.exr'), restir_dr_image)
-    mi.util.write_bitmap(os.path.join(output_dir, 'texture_final_restir_dr.png'), restir_dr_param)
+    write_image('render_final_restir_dr', restir_dr_image, hdr=True)
+    write_image('texture_final_restir_dr', restir_dr_param, hdr=False)
 
-    set_max_depth(scene, 2)
-    restir_dr_image_direct = render_clean_image(scene);
-    mi.util.write_bitmap(os.path.join(output_dir, 'render_final_restir_dr_direct.exr'), restir_dr_image_direct)
-    set_max_depth(scene)
+    # Render ReSTIR DR result with direct lighting only
+    #set_max_depth(scene, 2)
+    #restir_dr_image_direct = render_clean_image(scene);
+    #write_image('render_final_restir_dr_direct', restir_dr_image_direct, hdr=True)
+    #set_max_depth(scene)
